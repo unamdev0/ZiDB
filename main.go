@@ -3,14 +3,16 @@ package main
 // TODO: need to optimize struct declaration because of padding
 
 // TODO: Make sure the address provided in rowAddress is divisible by 4,as we're going to start
-//  	 saving id and then rest of the columns 	
+//  	 saving id and then rest of the columns
 
+//TODO: Skipped saving partial page to db for now
 
 import (
 	"bufio"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -24,6 +26,10 @@ var (
 	ErrUnrecognizedStatement = errors.New("unrecognized statement")
 	ErrUnrecognizedCommand   = errors.New("unrecognized command")
 	ErrSyntaxError           = errors.New("syntax error")
+	ErrOutOfBoundPageNum     = errors.New("page number entered is greater than total DB capacity")
+	ErrReadingFile           = errors.New("can't read db file")
+	ErrNoContentFound        = errors.New("page does not exist")
+	ErrDataNotSaved          = errors.New("could not save data to DB")
 )
 
 const (
@@ -66,17 +72,27 @@ type Statement struct {
 
 type Table struct {
 	rowsInserted uint32
-	pages        [MAX_PAGE_NUM]*MemoryBlock
+	pager        *Pager
+}
+
+type Pager struct {
+	file     *os.File
+	fileSize uint32
+	pages    [MAX_PAGE_NUM]*MemoryBlock
 }
 
 func rowAddress(rowNumber uint32, table *Table) uintptr {
 
 	pageNum := rowNumber / ROWS_PER_PAGE
-	page := table.pages[pageNum]
-	if page == nil {
-		// Allocate memory only when we try to access the page
-		page = &MemoryBlock{}
-		table.pages[pageNum] = page
+	page, err := getPage(table.pager, pageNum)
+	// if page == nil {
+	// 	// Allocate memory only when we try to access the page
+	// 	page = &MemoryBlock{}
+	// 	table.pages[pageNum] = page
+	// }
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(-1)
 	}
 	rowOffset := rowNumber % ROWS_PER_PAGE
 	byteOffset := rowOffset * uint32(ROW_SIZE)
@@ -85,7 +101,6 @@ func rowAddress(rowNumber uint32, table *Table) uintptr {
 }
 
 func store(to uintptr, data *Row) {
-
 	*(*uint32)(unsafe.Pointer(to)) = data.id
 
 	// Since copy func in golang works only on slice, we'll have to convert email and username of row struct to slice
@@ -107,8 +122,32 @@ func read(data *Row, from uintptr) {
 
 }
 
+// OpenOrCreateFile function opens a file if it exists, or creates it if it doesn't
+func OpenOrCreateFile(filename string) (*Pager, error) {
+	// Open the file with read-write permissions, creating it if necessary
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open or create file: %w", err)
+	}
+
+	fi, err := file.Stat()
+	if err != nil {
+		// Could not obtain stat, handle error
+	}
+
+	fmt.Printf("The file is %d bytes long", fi.Size())
+
+	// Return the file wrapped in a FileHandler struct
+	pager := &Pager{file: file, fileSize: uint32(fi.Size())}
+	return pager, nil
+}
+
 func main() {
-	table := &Table{rowsInserted: 0}
+	table, err := openDB("db.txt")
+	if err != nil {
+		fmt.Println("Error while opening file:", err)
+		os.Exit(-1)
+	}
 	// Listen for incoming connections on port 6001 by default
 	listener, err := net.Listen("tcp", defaultPort)
 	if err != nil {
@@ -149,6 +188,7 @@ func handleConnection(conn net.Conn, table *Table) {
 
 		// If the client sends "exit", close the connection
 		if message == "exit\n" {
+			closeDB(table)
 			fmt.Println("Client requested to close the connection")
 			break
 		}
@@ -232,4 +272,84 @@ func selectCommand(table *Table) {
 
 func printRow(row *Row) string {
 	return fmt.Sprintf("ROW ID->%d, USERNAME->%s, EMAIL->%s\n", row.id, row.username, row.email)
+}
+
+// ITERATION 3:
+
+//	Need to save data entered in a file
+//  A single file which will contain all the pages(array of bytes)
+//  when exiting program, all the data is written to this file
+//  when server is started the whole data is again loaded from this file
+
+func getPage(pager *Pager, pageNum uint32) (*MemoryBlock, error) {
+	if pageNum > MAX_PAGE_NUM {
+		return nil, ErrOutOfBoundPageNum
+	}
+
+	if pager.pages[pageNum] == nil {
+		var page MemoryBlock
+		var numPages uint32
+		page = MemoryBlock{}
+		numPages = pager.fileSize / PAGE_SIZE
+
+		if pager.fileSize%uint32(PAGE_SIZE) != 0 {
+			numPages += 1
+		}
+
+		if pageNum <= numPages {
+			// Calculate the offset and seek to the desired position
+			offset := int64(pageNum * PAGE_SIZE)
+			_, err := pager.file.Seek(offset, 0) // 0 is equivalent to SEEK_SET
+			if err != nil {
+				fmt.Println("Error seeking file:", err)
+				return nil, ErrReadingFile
+			}
+			len, err := pager.file.Read(page.data[:])
+			if len == -1 {
+				fmt.Println("Error reading file:", err)
+				return nil, ErrReadingFile
+			}
+
+		}
+		pager.pages[pageNum] = &page
+	}
+	return pager.pages[pageNum], nil
+}
+
+func openDB(filename string) (*Table, error) {
+	pager, err := OpenOrCreateFile(filename)
+
+	if err != nil {
+		return nil, err
+	}
+	var numRows uint32 = pager.fileSize / uint32(ROW_SIZE)
+	table := &Table{rowsInserted: numRows, pager: pager}
+
+
+	return table, nil
+
+}
+
+func closeDB(table *Table) {
+	for i := 0; i < MAX_PAGE_NUM; i++ {
+		if table.pager.pages[i] != nil {
+			writeToFile(table.pager, uint32(i))
+		} else {
+			break
+		}
+	}
+}
+
+func writeToFile(pager *Pager, pageNum uint32) {
+	if pager.pages[pageNum] == nil {
+		fmt.Println(ErrNoContentFound)
+		os.Exit(-1)
+	}
+
+	offset := int64(pageNum * PAGE_SIZE)
+	_, err := pager.file.WriteAt(pager.pages[pageNum].data[:], offset)
+	if err != nil {
+		fmt.Println(ErrDataNotSaved)
+		os.Exit(-1)
+	}
 }
