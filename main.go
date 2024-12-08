@@ -1,5 +1,22 @@
 package main
 
+// ITERATION 3:
+
+//	Need to save data entered in a file
+//  A single file which will contain all the pages(array of bytes)
+//  when exiting program, all the data is written to this file
+//  when server is started the whole data is again loaded from this file
+
+// ITERATION 4:
+
+// Need to create cursor(s)
+// they'll be used to point to different rows and perform action based on it
+// Initially two cursors will be created, one which will point to the start of the table and
+// one will point to the last data of the table
+// First will be used for select statements while the second will be used for insert statements
+
+// **************************TODO***********************
+
 // TODO: need to optimize struct declaration because of padding
 
 // TODO: Make sure the address provided in rowAddress is divisible by 4,as we're going to start
@@ -21,6 +38,7 @@ import (
 const defaultPort = ":6001"
 
 type StatementType int
+type NodeType int
 
 var (
 	ErrUnrecognizedStatement = errors.New("unrecognized statement")
@@ -53,6 +71,12 @@ const (
 	Insert StatementType = 2
 )
 
+const (
+	// Node type 0 denotes leaf node 1 denotes internal node
+	Leaf     NodeType = 1
+	Internal NodeType = 1
+)
+
 type MemoryBlock struct {
 	data [PAGE_SIZE]byte
 }
@@ -81,10 +105,16 @@ type Pager struct {
 	pages    [MAX_PAGE_NUM]*MemoryBlock
 }
 
-func rowAddress(rowNumber uint32, table *Table) uintptr {
+type Cursor struct {
+	table  *Table
+	rowNum uint32
+	isEnd  bool
+}
 
-	pageNum := rowNumber / ROWS_PER_PAGE
-	page, err := getPage(table.pager, pageNum)
+func cursorValue(cursor *Cursor) uintptr {
+
+	pageNum := cursor.rowNum / ROWS_PER_PAGE
+	page, err := getPage(cursor.table.pager, pageNum)
 	// if page == nil {
 	// 	// Allocate memory only when we try to access the page
 	// 	page = &MemoryBlock{}
@@ -94,7 +124,7 @@ func rowAddress(rowNumber uint32, table *Table) uintptr {
 		fmt.Println(err.Error())
 		os.Exit(-1)
 	}
-	rowOffset := rowNumber % ROWS_PER_PAGE
+	rowOffset := cursor.rowNum % ROWS_PER_PAGE
 	byteOffset := rowOffset * uint32(ROW_SIZE)
 
 	return uintptr(unsafe.Pointer(&page.data[0])) + uintptr(byteOffset)
@@ -250,7 +280,8 @@ func insertCommand(statement *Statement, table *Table) string {
 
 	copy(statement.RowToInsert.email[:], args[3])
 
-	ptr := rowAddress(table.rowsInserted, table)
+	cursor := endingCursor(table)
+	ptr := cursorValue(cursor)
 
 	store(ptr, &statement.RowToInsert)
 	table.rowsInserted += 1
@@ -258,14 +289,15 @@ func insertCommand(statement *Statement, table *Table) string {
 }
 
 func selectCommand(table *Table) {
-	var i uint32 = 0
-	for i < (table.rowsInserted) {
+	cursor := startingCursor(table)
+
+	for !cursor.isEnd {
 		var row Row
-		ptr := rowAddress(i, table)
+		ptr := cursorValue(cursor)
 
 		read(&row, ptr)
 		fmt.Print(printRow(&row))
-		i++
+		cursor = advanceCursor(cursor)
 	}
 
 }
@@ -273,13 +305,6 @@ func selectCommand(table *Table) {
 func printRow(row *Row) string {
 	return fmt.Sprintf("ROW ID->%d, USERNAME->%s, EMAIL->%s\n", row.id, row.username, row.email)
 }
-
-// ITERATION 3:
-
-//	Need to save data entered in a file
-//  A single file which will contain all the pages(array of bytes)
-//  when exiting program, all the data is written to this file
-//  when server is started the whole data is again loaded from this file
 
 func getPage(pager *Pager, pageNum uint32) (*MemoryBlock, error) {
 	if pageNum > MAX_PAGE_NUM {
@@ -325,7 +350,6 @@ func openDB(filename string) (*Table, error) {
 	var numRows uint32 = pager.fileSize / uint32(ROW_SIZE)
 	table := &Table{rowsInserted: numRows, pager: pager}
 
-
 	return table, nil
 
 }
@@ -352,4 +376,29 @@ func writeToFile(pager *Pager, pageNum uint32) {
 		fmt.Println(ErrDataNotSaved)
 		os.Exit(-1)
 	}
+}
+
+func startingCursor(table *Table) *Cursor {
+	return &Cursor{
+		table:  table,
+		rowNum: 0,
+		isEnd:  table.rowsInserted == 0,
+	}
+}
+
+func endingCursor(table *Table) *Cursor {
+	return &Cursor{
+		table:  table,
+		rowNum: table.rowsInserted,
+		isEnd:  true,
+	}
+}
+
+func advanceCursor(cursor *Cursor) *Cursor {
+	cursor.rowNum += 1
+	if cursor.rowNum == cursor.table.rowsInserted {
+		cursor.isEnd = true
+	}
+	return cursor
+
 }
