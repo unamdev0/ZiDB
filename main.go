@@ -66,6 +66,26 @@ const (
 )
 
 const (
+	NODE_TYPE_SIZE             = unsafe.Sizeof(uint8(0))
+	NODE_TYPE_OFFSET           = 0
+	IS_ROOT_SIZE               = unsafe.Sizeof(uint8(0))
+	IS_ROOT_OFFSET             = NODE_TYPE_SIZE
+	PARENT_POINTER_SIZE        = unsafe.Sizeof(uint32(0))
+	PARENT_POINTER_OFFSET      = NODE_TYPE_OFFSET + IS_ROOT_OFFSET
+	COMMON_NODE_HEADER_SIZE    = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE
+	LEAF_NODE_NUM_CELLS_SIZE   = unsafe.Sizeof(uint32(0))
+	LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+	LEAF_NODE_HEADER_SIZE      = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+	LEAF_NODE_KEY_SIZE         = unsafe.Sizeof(uint32(0))
+	LEAF_NODE_KEY_OFFSET       = 0
+	LEAF_NODE_VALUE_SIZE       = ROW_SIZE
+	LEAF_NODE_VALUE_OFFSET     = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE
+	LEAF_NODE_CELL_SIZE        = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
+	LEAF_NODE_SPACE_FOR_CELLS  = PAGE_SIZE - LEAF_NODE_HEADER_SIZE
+	LEAF_NODE_MAX_CELLS        = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE
+)
+
+const (
 	// starting with 1 as 0 will be put as default value
 	Select StatementType = 1
 	Insert StatementType = 2
@@ -95,25 +115,27 @@ type Statement struct {
 }
 
 type Table struct {
-	rowsInserted uint32
-	pager        *Pager
+	rootPageNum uint32
+	pager       *Pager
 }
 
 type Pager struct {
 	file     *os.File
 	fileSize uint32
+	numPages uint32
 	pages    [MAX_PAGE_NUM]*MemoryBlock
 }
 
 type Cursor struct {
-	table  *Table
-	rowNum uint32
-	isEnd  bool
+	table   *Table
+	pageNum uint32
+	cellNum uint32
+	isEnd   bool
 }
 
 func cursorValue(cursor *Cursor) uintptr {
 
-	pageNum := cursor.rowNum / ROWS_PER_PAGE
+	pageNum := cursor.pageNum
 	page, err := getPage(cursor.table.pager, pageNum)
 	// if page == nil {
 	// 	// Allocate memory only when we try to access the page
@@ -124,10 +146,7 @@ func cursorValue(cursor *Cursor) uintptr {
 		fmt.Println(err.Error())
 		os.Exit(-1)
 	}
-	rowOffset := cursor.rowNum % ROWS_PER_PAGE
-	byteOffset := rowOffset * uint32(ROW_SIZE)
-
-	return uintptr(unsafe.Pointer(&page.data[0])) + uintptr(byteOffset)
+	return leafNodeValue(uintptr(unsafe.Pointer(&page.data[0])), cursor.cellNum)
 }
 
 func store(to uintptr, data *Row) {
@@ -168,7 +187,7 @@ func OpenOrCreateFile(filename string) (*Pager, error) {
 	fmt.Printf("The file is %d bytes long", fi.Size())
 
 	// Return the file wrapped in a FileHandler struct
-	pager := &Pager{file: file, fileSize: uint32(fi.Size())}
+	pager := &Pager{file: file, fileSize: uint32(fi.Size()), numPages: uint32(fi.Size() / PAGE_SIZE)}
 	return pager, nil
 }
 
@@ -281,10 +300,8 @@ func insertCommand(statement *Statement, table *Table) string {
 	copy(statement.RowToInsert.email[:], args[3])
 
 	cursor := endingCursor(table)
-	ptr := cursorValue(cursor)
 
-	store(ptr, &statement.RowToInsert)
-	table.rowsInserted += 1
+	insertLeafNode(cursor, statement.RowToInsert.id, &statement.RowToInsert)
 	return "Executing insert Command"
 }
 
@@ -337,6 +354,10 @@ func getPage(pager *Pager, pageNum uint32) (*MemoryBlock, error) {
 
 		}
 		pager.pages[pageNum] = &page
+
+		if pageNum >= pager.numPages {
+			pager.numPages = pageNum + 1
+		}
 	}
 	return pager.pages[pageNum], nil
 }
@@ -347,8 +368,12 @@ func openDB(filename string) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	var numRows uint32 = pager.fileSize / uint32(ROW_SIZE)
-	table := &Table{rowsInserted: numRows, pager: pager}
+	table := &Table{rootPageNum: 0, pager: pager}
+	if pager.numPages == 0 {
+		rootNode, _ := getPage(pager, 0)
+		initalizeLeafNode(uintptr(unsafe.Pointer(&rootNode.data[0])))
+
+	}
 
 	return table, nil
 
@@ -379,26 +404,81 @@ func writeToFile(pager *Pager, pageNum uint32) {
 }
 
 func startingCursor(table *Table) *Cursor {
+
+	rootNode, _ := getPage(table.pager, table.rootPageNum)
+	numCells := *(*uint32)(unsafe.Pointer(leafNodeNumCell(uintptr(unsafe.Pointer(&rootNode.data[0])))))
+
 	return &Cursor{
-		table:  table,
-		rowNum: 0,
-		isEnd:  table.rowsInserted == 0,
+		table:   table,
+		pageNum: table.rootPageNum,
+		cellNum: 0,
+		isEnd:   numCells == 0,
 	}
 }
 
 func endingCursor(table *Table) *Cursor {
+	rootNode, _ := getPage(table.pager, table.rootPageNum)
+	numCells := *(*uint32)(unsafe.Pointer(leafNodeNumCell(uintptr(unsafe.Pointer(&rootNode.data[0])))))
+
 	return &Cursor{
-		table:  table,
-		rowNum: table.rowsInserted,
-		isEnd:  true,
+		table:   table,
+		pageNum: table.rootPageNum,
+		cellNum: numCells,
+		isEnd:   true,
 	}
 }
 
 func advanceCursor(cursor *Cursor) *Cursor {
-	cursor.rowNum += 1
-	if cursor.rowNum == cursor.table.rowsInserted {
+
+	pageNum := cursor.pageNum
+	node, _ := getPage(cursor.table.pager, pageNum)
+
+	cursor.cellNum += 1
+	if cursor.cellNum >= *(*uint32)(unsafe.Pointer(leafNodeNumCell(uintptr(unsafe.Pointer(&node.data[0]))))) {
 		cursor.isEnd = true
 	}
 	return cursor
 
+}
+
+func leafNodeNumCell(nodeAddr uintptr) uintptr {
+
+	return nodeAddr + LEAF_NODE_NUM_CELLS_OFFSET
+}
+
+func leafNodeCell(node uintptr, cellNum uint32) uintptr {
+	return node + LEAF_NODE_HEADER_SIZE + (uintptr(cellNum) * LEAF_NODE_CELL_SIZE)
+}
+
+func leafNodeValue(node uintptr, cellNum uint32) uintptr {
+	return leafNodeCell(node, cellNum) + LEAF_NODE_KEY_SIZE
+}
+
+func initalizeLeafNode(node uintptr) {
+
+	*(*uint32)(unsafe.Pointer(leafNodeNumCell(node))) = 0
+
+}
+
+func insertLeafNode(cursor *Cursor, key uint32, data *Row) {
+
+	node, _ := getPage(cursor.table.pager, cursor.pageNum)
+	nodeAddr := uintptr(unsafe.Pointer(&node.data[0]))
+	numCells := *(*uint32)(unsafe.Pointer(leafNodeNumCell(nodeAddr)))
+
+	if numCells >= uint32(LEAF_NODE_MAX_CELLS) {
+		//throw err
+	}
+
+	if cursor.cellNum < numCells {
+
+		for i := numCells; i < cursor.cellNum; i-- {
+
+			copy(unsafe.Slice((*byte)(unsafe.Pointer(leafNodeCell(nodeAddr, i))), LEAF_NODE_CELL_SIZE), unsafe.Slice((*byte)(unsafe.Pointer(leafNodeCell(nodeAddr, i-1))), LEAF_NODE_CELL_SIZE))
+		}
+	}
+
+	*(*uint32)(unsafe.Pointer(leafNodeNumCell(nodeAddr))) = *(*uint32)(unsafe.Pointer(leafNodeNumCell(nodeAddr))) + 1
+	*(*uint32)(unsafe.Pointer(leafNodeCell(nodeAddr, cursor.cellNum))) = key
+	store(leafNodeValue(nodeAddr, cursor.cellNum), data)
 }
